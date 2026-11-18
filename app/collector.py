@@ -29,6 +29,7 @@ from typing import Any
 from .config import Settings
 from .db import Database, transaction, utcnow
 from .mailparse import parse_mail, validate_mail
+from .qc import compute_verdict, rules_map_tx, write_report_items_tx, write_verdict_tx
 from .store import Store
 
 log = logging.getLogger("bridge.collector")
@@ -537,6 +538,7 @@ class Collector:
                                 "disposition": "reused",
                                 "path": row["attachment_path"],
                                 "name": row["attachment_name"],
+                                "report_id": int(row["id"]),
                             }
                         )
                     else:
@@ -571,6 +573,7 @@ class Collector:
                                 "name": item["name"],
                                 "rows": item["rows"],
                                 "disposition": "reused",
+                                "report_id": item["report_id"],
                             }
                         )
                         reused_count += 1
@@ -645,30 +648,54 @@ class Collector:
                     ),
                 )
                 message_id = int(cur.lastrowid)
+                # QC: check every newly warehoused report row-by-row inside
+                # the same transaction, so a report and its conclusion are
+                # always committed (or rolled back) together.
+                rules = rules_map_tx(conn)
                 for item in prepared:
-                    conn.execute(
-                        """INSERT OR IGNORE INTO report
-                           (account, mailbox, report_no, sample_no, item, value,
-                            rows_json, attachment_sha256, attachment_name,
-                            attachment_path, source_message_id, created_at,
-                            updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            account,
-                            mailbox,
-                            item["report_no"],
-                            item["rows"][0][1],
-                            item["rows"][0][2],
-                            item["rows"][0][3],
-                            _json(item["rows"]),
-                            item["sha256"],
-                            item["name"],
-                            item["path"],
-                            message_id,
-                            utcnow(),
-                            utcnow(),
-                        ),
-                    )
+                    if item["disposition"] == "new":
+                        conn.execute(
+                            """INSERT OR IGNORE INTO report
+                               (account, mailbox, report_no, sample_no, item, value,
+                                rows_json, attachment_sha256, attachment_name,
+                                attachment_path, source_message_id, created_at,
+                                updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                account,
+                                mailbox,
+                                item["report_no"],
+                                item["rows"][0][1],
+                                item["rows"][0][2],
+                                item["rows"][0][3],
+                                _json(item["rows"]),
+                                item["sha256"],
+                                item["name"],
+                                item["path"],
+                                message_id,
+                                utcnow(),
+                                utcnow(),
+                            ),
+                        )
+                        row = conn.execute(
+                            """SELECT id FROM report
+                               WHERE account=? AND mailbox=? AND report_no=?""",
+                            (account, mailbox, item["report_no"]),
+                        ).fetchone()
+                        report_id = int(row["id"])
+                    else:
+                        report_id = item["report_id"]
+                    write_report_items_tx(conn, report_id, item["rows"])
+                    has_verdict = conn.execute(
+                        "SELECT 1 FROM qc_verdict WHERE report_id=?", (report_id,)
+                    ).fetchone()
+                    if has_verdict is None:
+                        write_verdict_tx(
+                            conn,
+                            report_id,
+                            compute_verdict(item["rows"], rules),
+                            self.settings.instance_id,
+                        )
                     conn.execute(
                         """INSERT OR REPLACE INTO delivery
                            (message_id, report_no, attachment_sha256,

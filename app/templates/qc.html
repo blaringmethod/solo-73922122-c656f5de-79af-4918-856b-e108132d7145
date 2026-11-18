@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block content %}
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<section class="cards">
+  <div class="card"><span>质检规则</span><strong>{{ stats.qc_rules }}</strong></div>
+  <div class="card"><span>可分析</span><strong>{{ stats.qc_analyzable }}</strong></div>
+  <div class="card warn"><span>待复核</span><strong>{{ stats.qc_pending_review }}</strong></div>
+  <div class="card"><span>未判定</span><strong>{{ stats.qc_undetermined }}</strong></div>
+  <div class="card warn"><span>结论已过期</span><strong>{{ stats.qc_stale }}</strong></div>
+  <div class="card"><span>未计算</span><strong>{{ stats.qc_uncomputed }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>项目测值规则（十进制上下限，含边界）</h2>
+  <form method="post" action="/actions/qc/rule" class="rule-form">
+    <label>项目 <input name="item" required maxlength="100" placeholder="如 ALT"></label>
+    <label>下限 <input name="lower" required placeholder="如 0"></label>
+    <label>上限 <input name="upper" required placeholder="如 40"></label>
+    <button type="submit">保存规则并重算</button>
+  </form>
+  <p class="hint">
+    为单个项目设置或修订上下限；测值按十进制精确比较。修订后旧结论立即标为“过期”，
+    并自动重算全部受影响报告（含重算期间入仓的新报告）；重算失败不会留下半份结论，可重试。
+    当前规则代数：<code>{{ generation }}</code>。
+  </p>
+  <table>
+    <thead><tr><th>项目</th><th>下限</th><th>上限</th><th>版本</th><th>更新时间</th><th>更新实例</th></tr></thead>
+    <tbody>
+    {% for r in rules %}
+      <tr>
+        <td><code>{{ r.item }}</code></td>
+        <td class="mono">{{ r.lower_limit }}</td>
+        <td class="mono">{{ r.upper_limit }}</td>
+        <td>v{{ r.version }}</td>
+        <td class="nowrap">{{ r.updated_at }}</td>
+        <td><code>{{ r.updated_by }}</code></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">暂无规则。未配置规则的项目测值结论为“未判定”。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>结论重算</h2>
+  <div class="actions">
+    <form method="post" action="/actions/qc/recompute">
+      <button type="submit" class="secondary">重新计算过期 / 缺失结论</button>
+    </form>
+  </div>
+  <p class="hint">
+    重算期间另一实例照常收件；新结论在单个事务内原子发布，并覆盖重算期间入仓的报告。
+    规则在重算期间再次变化时本次发布自动作废并重试。
+  </p>
+</section>
+
+<section class="panel">
+  <h2>报告质检结论</h2>
+  <p class="filters">
+    <a href="/qc" class="{{ 'active' if not status_filter and not stale_only }}">全部</a>
+    <a href="/qc?status=analyzable" class="{{ 'active' if status_filter == 'analyzable' }}">可分析</a>
+    <a href="/qc?status=pending_review" class="{{ 'active' if status_filter == 'pending_review' }}">待复核</a>
+    <a href="/qc?status=undetermined" class="{{ 'active' if status_filter == 'undetermined' }}">未判定</a>
+    <a href="/qc?stale=1" class="{{ 'active' if stale_only }}">只看过期</a>
+  </p>
+  <table>
+    <thead><tr>
+      <th>报告号</th><th>结论</th><th>越界 / 非数值行（行号与原值）</th>
+      <th>未配置规则行</th><th>计算时间</th><th>实例</th>
+    </tr></thead>
+    <tbody>
+    {% for v in verdicts %}
+      <tr class="{{ 'row-bad' if v.status == 'pending_review' else '' }}">
+        <td><code>{{ v.report_no }}</code></td>
+        <td class="nowrap">
+          <span class="badge {{ {'analyzable': 'ok', 'pending_review': 'bad', 'undetermined': 'warn'}[v.status] }}">
+            {{ v.status_label }}
+          </span>
+          {% if v.stale %}
+            <span class="badge warn">过期</span>
+            <div class="reason">{{ v.stale_reason }}</div>
+          {% endif %}
+        </td>
+        <td>
+          {% if v.findings %}
+            <ul class="reasons">
+            {% for f in v.findings %}
+              <li>
+                第 {{ f.lineno }} 行 <code>{{ f.item }}</code> 原值 <code>{{ f.value }}</code>：
+                {% if f.kind == 'non_numeric' %}非数值{% else %}越界（范围 {{ f.lower }} ～ {{ f.upper }}）{% endif %}
+              </li>
+            {% endfor %}
+            </ul>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if v.uncovered %}
+            <ul class="plain-list">
+            {% for u in v.uncovered %}
+              <li>第 {{ u.lineno }} 行 <code>{{ u.item }}</code> 原值 <code>{{ u.value }}</code></li>
+            {% endfor %}
+            </ul>
+          {% else %}—{% endif %}
+        </td>
+        <td class="nowrap">{{ v.computed_at }}</td>
+        <td><code>{{ v.instance }}</code></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">暂无结论。新到报告入仓时自动判定；历史报告请点“重新计算”。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

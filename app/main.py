@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -17,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from .collector import Collector, ScanBusy
 from .config import Settings, settings
 from .db import Database
+from .qc import QcEngine, RuleInvalid, STATUS_LABELS
 from .store import Store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,11 +46,61 @@ def _message_view(db: Database, row) -> dict[str, Any]:
     return item
 
 
+def _verdict_view(row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["findings"] = json.loads(item.get("findings_json") or "[]")
+    except json.JSONDecodeError:
+        item["findings"] = []
+    try:
+        item["uncovered"] = json.loads(item.get("uncovered_json") or "[]")
+    except json.JSONDecodeError:
+        item["uncovered"] = []
+    item["stale"] = bool(item.get("stale"))
+    item["status_label"] = STATUS_LABELS.get(item.get("status"), item.get("status"))
+    return item
+
+
+async def _form(request: Request) -> dict[str, str]:
+    """Parse a urlencoded form body without extra dependencies."""
+    body = (await request.body()).decode("utf-8", "replace")
+    return {key: values[0] for key, values in parse_qs(body).items()}
+
+
+def _qc_change_text(change: dict[str, Any]) -> str:
+    if change["change"] == "unchanged":
+        return f"项目 {change['item']} 的规则未变化（v{change['version']}）"
+    verb = "已设置" if change["change"] == "created" else "已修订"
+    return (
+        f"项目 {change['item']} 规则{verb}为 v{change['version']}，"
+        f"{change['staled']} 条旧结论已标过期"
+    )
+
+
+def _qc_recompute_text(summary: dict[str, Any]) -> str:
+    status = summary.get("status")
+    if status == "completed":
+        return (
+            f"重算完成：发布 {summary['written']} 条结论"
+            f"（其中同期入仓补算 {summary['caught_up']} 条，第 {summary.get('attempts', 1)} 次尝试）"
+        )
+    if status == "busy":
+        return f"重算未执行：{summary.get('error', '另一实例正在重算')}"
+    return f"重算失败：{summary.get('error', '未知原因')}（未发布任何结论，可重试）"
+
+
 def create_app(cfg: Settings | None = None) -> FastAPI:
     cfg = cfg or settings
     db = Database(cfg.database_path)
     store = Store(cfg.storage_dir)
     collector = Collector(cfg, db, store)
+    qc_engine = QcEngine(
+        db,
+        cfg.instance_id,
+        lease_seconds=cfg.qc_lease_seconds,
+        catch_up_limit=cfg.qc_catch_up_limit,
+        max_attempts=cfg.qc_recompute_max_attempts,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -106,6 +158,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     app.state.db = db
     app.state.store = store
     app.state.collector = collector
+    app.state.qc = qc_engine
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
     # ------------------------------------------------------------------ pages
@@ -114,6 +167,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         mark_filter = request.query_params.get("mark") or None
         messages = [_message_view(db, row) for row in db.list_messages(100, mark_filter)]
         reports = [dict(r) for r in db.list_reports(200)]
+        qc_map = {
+            report_id: _verdict_view(row)
+            for report_id, row in db.qc_verdict_map([r["id"] for r in reports]).items()
+        }
         state = db.get_state(cfg.account, cfg.imap_mailbox)
         return templates.TemplateResponse(
             request,
@@ -123,6 +180,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 "stats": db.stats(),
                 "messages": messages,
                 "reports": reports,
+                "qc_map": qc_map,
                 "scans": [dict(r) for r in db.recent_scans(15)],
                 "state": _row_to_dict(state),
                 "mark_filter": mark_filter or "",
@@ -160,6 +218,64 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             log.exception("retry marks failed")
             return RedirectResponse(f"/?flash=&error={_q(str(exc))}", status_code=303)
         return RedirectResponse(f"/?flash={_q(f'补标记完成：{marked} 封')}", status_code=303)
+
+    # -------------------------------------------------------------- QC page
+    @app.get("/qc", response_class=HTMLResponse)
+    def qc_page(request: Request):
+        status_filter = request.query_params.get("status") or ""
+        if status_filter not in STATUS_LABELS:
+            status_filter = ""
+        stale_only = request.query_params.get("stale") == "1"
+        verdicts = [
+            _verdict_view(row)
+            for row in db.qc_verdicts(
+                200, status_filter or None, True if stale_only else None
+            )
+        ]
+        return templates.TemplateResponse(
+            request,
+            "qc.html",
+            {
+                "cfg": cfg,
+                "stats": db.stats(),
+                "rules": [dict(r) for r in db.qc_rules()],
+                "generation": db.qc_rules_generation(),
+                "verdicts": verdicts,
+                "status_filter": status_filter,
+                "stale_only": stale_only,
+                "flash": request.query_params.get("flash", ""),
+                "error": request.query_params.get("error", ""),
+            },
+        )
+
+    @app.post("/actions/qc/rule")
+    async def action_qc_rule(request: Request):
+        form = await _form(request)
+        try:
+            change = await asyncio.to_thread(
+                qc_engine.save_rule,
+                form.get("item", ""),
+                form.get("lower", ""),
+                form.get("upper", ""),
+            )
+        except RuleInvalid as exc:
+            return RedirectResponse(f"/qc?flash=&error={_q(str(exc))}", status_code=303)
+        except Exception as exc:
+            log.exception("qc rule save failed")
+            return RedirectResponse(f"/qc?flash=&error={_q(str(exc))}", status_code=303)
+        summary = await asyncio.to_thread(qc_engine.try_recompute)
+        text = f"{_qc_change_text(change)}；{_qc_recompute_text(summary)}"
+        if summary.get("status") == "completed":
+            return RedirectResponse(f"/qc?flash={_q(text)}", status_code=303)
+        return RedirectResponse(f"/qc?flash=&error={_q(text)}", status_code=303)
+
+    @app.post("/actions/qc/recompute")
+    async def action_qc_recompute():
+        summary = await asyncio.to_thread(qc_engine.try_recompute)
+        text = _qc_recompute_text(summary)
+        if summary.get("status") == "completed":
+            return RedirectResponse(f"/qc?flash={_q(text)}", status_code=303)
+        return RedirectResponse(f"/qc?flash=&error={_q(text)}", status_code=303)
 
     # -------------------------------------------------------------------- API
     @app.get("/healthz")
@@ -258,6 +374,74 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             media_type="text/csv; charset=utf-8",
             filename=row["attachment_name"],
         )
+
+    # ---------------------------------------------------------------- QC API
+    @app.get("/api/qc/rules")
+    def api_qc_rules():
+        return {
+            "generation": db.qc_rules_generation(),
+            "rules": [dict(r) for r in db.qc_rules()],
+        }
+
+    @app.post("/api/qc/rules")
+    async def api_qc_save_rule(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"请求体不是合法 JSON：{exc}") from exc
+        try:
+            change = await asyncio.to_thread(
+                qc_engine.save_rule,
+                str(body.get("item", "")),
+                str(body.get("lower", "")),
+                str(body.get("upper", "")),
+            )
+        except RuleInvalid as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        result: dict[str, Any] = {"rule": change}
+        # ``recompute: false`` lets a caller inspect the stale (过期) state
+        # before publishing new conclusions; the default converges at once.
+        if body.get("recompute", True):
+            result["recompute"] = await asyncio.to_thread(qc_engine.try_recompute)
+        return result
+
+    @app.post("/api/qc/recompute")
+    async def api_qc_recompute():
+        summary = await asyncio.to_thread(qc_engine.try_recompute)
+        if summary.get("status") == "busy":
+            raise HTTPException(status_code=409, detail=summary.get("error"))
+        if summary.get("status") != "completed":
+            raise HTTPException(
+                status_code=500,
+                detail=f"{summary.get('error', '重算失败')}（未发布任何结论，可重试）",
+            )
+        return summary
+
+    @app.get("/api/qc/verdicts")
+    def api_qc_verdicts(
+        limit: int = 200,
+        status: str | None = None,
+        stale: int | None = None,
+    ):
+        if status is not None and status not in STATUS_LABELS:
+            raise HTTPException(status_code=422, detail=f"未知结论状态：{status}")
+        stale_filter = None if stale is None else bool(stale)
+        return [
+            _verdict_view(row)
+            for row in db.qc_verdicts(limit, status, stale_filter)
+        ]
+
+    @app.get("/api/reports/{report_id}/qc")
+    def api_report_qc(report_id: int):
+        report = db.get_report(report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="report not found")
+        row = db.qc_verdict_for_report(report_id)
+        return {
+            "report_id": report_id,
+            "report_no": report["report_no"],
+            "verdict": _verdict_view(row) if row is not None else None,
+        }
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):

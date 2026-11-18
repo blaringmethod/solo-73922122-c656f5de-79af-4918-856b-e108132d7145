@@ -13,6 +13,14 @@
   <div class="card"><span>旧代失效标记</span><strong>{{ stats.stale_marks }}</strong></div>
 </section>
 
+<section class="cards">
+  <div class="card"><span>可分析</span><strong>{{ stats.qc_analyzable }}</strong></div>
+  <div class="card warn"><span>待复核</span><strong>{{ stats.qc_pending_review }}</strong></div>
+  <div class="card"><span>未判定</span><strong>{{ stats.qc_undetermined }}</strong></div>
+  <div class="card warn"><span>结论已过期</span><strong>{{ stats.qc_stale }}</strong></div>
+</section>
+<p class="hint"><a href="/qc">前往“测值质检”页面配置项目上下限、查看逐行核对结果 →</a></p>
+
 <section class="panel">
   <h2>采集状态</h2>
   <dl class="kv">
@@ -88,19 +96,28 @@
 <section class="panel">
   <h2>入仓报告</h2>
   <table>
-    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>附件</th></tr></thead>
+    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>质检结论</th><th>原件 SHA-256</th><th>附件</th></tr></thead>
     <tbody>
     {% for r in reports %}
+      {% set v = qc_map.get(r.id) %}
       <tr>
         <td><code>{{ r.report_no }}</code></td>
         <td>{{ r.sample_no }}</td>
         <td>{{ r.item }}</td>
         <td>{{ r.value }}</td>
+        <td class="nowrap">
+          {% if v %}
+            <span class="badge {{ {'analyzable': 'ok', 'pending_review': 'bad', 'undetermined': 'warn'}[v.status] }}">{{ v.status_label }}</span>
+            {% if v.stale %}<span class="badge warn">过期</span>{% endif %}
+          {% else %}
+            <span class="badge">未计算</span>
+          {% endif %}
+        </td>
         <td class="mono">{{ r.attachment_sha256[:16] }}…</td>
         <td><a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a></td>
       </tr>
     {% else %}
-      <tr><td colspan="6" class="empty">暂无报告。</td></tr>
+      <tr><td colspan="7" class="empty">暂无报告。</td></tr>
     {% endfor %}
     </tbody>
   </table>

@@ -82,6 +82,20 @@ class Settings:
         default_factory=lambda: float(_env("AUTO_SCAN_INTERVAL", "15"))
     )
 
+    # QC recompute coordination.  The lease keeps a single recompute running
+    # across both instances; the catch-up limit bounds how many reports that
+    # arrived during one publish may be computed inside the publish
+    # transaction before the run aborts and precomputes them instead.
+    qc_lease_seconds: float = field(
+        default_factory=lambda: float(_env("QC_RECOMPUTE_LEASE_SECONDS", "30"))
+    )
+    qc_catch_up_limit: int = field(
+        default_factory=lambda: _env_int("QC_CATCH_UP_LIMIT", 500)
+    )
+    qc_recompute_max_attempts: int = field(
+        default_factory=lambda: _env_int("QC_RECOMPUTE_MAX_ATTEMPTS", 5)
+    )
+
     # UI presentation only.
     title: str = field(default_factory=lambda: _env("APP_TITLE", "检验附件入仓桥"))
 

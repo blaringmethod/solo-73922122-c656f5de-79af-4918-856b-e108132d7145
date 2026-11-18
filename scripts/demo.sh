@@ -137,5 +137,50 @@ rows=json.load(sys.stdin)
 for r in sorted(rows, key=lambda x: (x["uidvalidity"], x["uid"]))[-10:]:
     print(r["uidvalidity"], r["uid"], r["decision"], r["mark_state"], r["report_nos"], r["reason"] or "")'
 
+step "9. 测值质检：配置 ALT 规则，越界/非数值/未配置逐行核对"
+curl -fsS -X POST "$APP_A/api/qc/rules" -H 'Content-Type: application/json' \
+  -d '{"item":"ALT","lower":"0","upper":"40"}' | json
+deliver '{"subject":"演示-质检","attachments":[
+  {"filename":"DEMO-Q1.csv","report_no":"DEMO-Q1","sample_no":"S101","item":"ALT","value":"21"},
+  {"filename":"DEMO-Q2.csv","report_no":"DEMO-Q2","sample_no":"S102","item":"ALT","value":"999"},
+  {"filename":"DEMO-Q3.csv","content":"报告号,样本号,项目,测值\nDEMO-Q3,S103,ALT,abc\nDEMO-Q3,S103,ALT,30\n"}]}'
+deliver '{"subject":"演示-质检-未配置","attachments":[
+  {"filename":"DEMO-Q4.csv","report_no":"DEMO-Q4","sample_no":"S104","item":"GLU","value":"5.4"}]}'
+curl -fsS -X POST "$APP_B/api/scan" | json
+curl -fsS "$APP_A/api/qc/verdicts" | python3 -c 'import json,sys
+rows={r["report_no"]:r for r in json.load(sys.stdin)}
+assert rows["DEMO-Q1"]["status"]=="analyzable", rows["DEMO-Q1"]
+f=rows["DEMO-Q2"]["findings"][0]
+assert rows["DEMO-Q2"]["status"]=="pending_review" and f["lineno"]==2 and f["value"]=="999", rows["DEMO-Q2"]
+f=rows["DEMO-Q3"]["findings"][0]
+assert rows["DEMO-Q3"]["status"]=="pending_review" and f["kind"]=="non_numeric" and f["value"]=="abc", rows["DEMO-Q3"]
+assert rows["DEMO-Q4"]["status"]=="undetermined", rows["DEMO-Q4"]
+print("逐行核对:", {k: v["status"] for k, v in sorted(rows.items()) if k.startswith("DEMO-Q")})'
+
+step "10. 修订规则：旧结论先标过期，重算期间另一实例照常收件"
+curl -fsS -X POST "$APP_A/api/qc/rules" -H 'Content-Type: application/json' \
+  -d '{"item":"ALT","lower":"0","upper":"15","recompute":false}' | json
+curl -fsS "$APP_A/api/qc/verdicts?stale=1" | python3 -c 'import json,sys
+rows=json.load(sys.stdin)
+assert any(r["report_no"]=="DEMO-Q1" for r in rows), "DEMO-Q1 结论应已标过期"
+print("过期结论:", [(r["report_no"], r["status"], r["stale_reason"]) for r in rows])'
+
+step "10b. 重算与同期收件并发：web-a 重算，web-b 同时采集新邮件"
+deliver '{"subject":"演示-重算同期入仓","attachments":[
+  {"filename":"DEMO-Q5.csv","report_no":"DEMO-Q5","sample_no":"S105","item":"ALT","value":"35"}]}'
+(curl -fsS -o /tmp/qc-recompute.json -w "recompute: %{http_code}\n" -X POST "$APP_A/api/qc/recompute" &
+ curl -fsS -o /tmp/qc-scan.json -w "scan: %{http_code}\n" -X POST "$APP_B/api/scan" &
+ wait) || true
+cat /tmp/qc-recompute.json 2>/dev/null | json || true
+cat /tmp/qc-scan.json 2>/dev/null | json || true
+curl -fsS "$APP_A/api/qc/verdicts" | python3 -c 'import json,sys
+rows=json.load(sys.stdin)
+assert not any(r["stale"] for r in rows), "重算后不应残留过期结论"
+by_no={r["report_no"]:r for r in rows}
+assert by_no["DEMO-Q1"]["status"]=="pending_review", by_no["DEMO-Q1"]  # 21 > 15
+assert by_no["DEMO-Q5"]["status"]=="pending_review", by_no["DEMO-Q5"]  # 35 > 15
+assert by_no["DEMO-Q5"]["stale"] is False
+print("重算后结论:", {k: v["status"] for k, v in sorted(by_no.items()) if k.startswith("DEMO-Q")})'
+
 echo
-echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面。"
+echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面，$APP_A/qc 为测值质检页。"

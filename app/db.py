@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utcnow() -> str:
@@ -163,6 +163,56 @@ class Database:
                     UNIQUE (message_id, report_no)
                 );
 
+                -- QC: per-item decimal limits.  ``version`` bumps on every
+                -- revision; verdicts record the rule versions they used so a
+                -- revision can mark exactly the affected conclusions stale.
+                CREATE TABLE IF NOT EXISTS qc_rule (
+                    item TEXT PRIMARY KEY,
+                    lower_limit TEXT NOT NULL,
+                    upper_limit TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL
+                );
+
+                -- QC bookkeeping: rules_generation (bumped on every rule
+                -- write, guards the recompute publish) and the recompute
+                -- lease (single JSON row).
+                CREATE TABLE IF NOT EXISTS qc_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                -- Distinct items per report, so a rule revision can find the
+                -- verdicts it invalidates without parsing rows_json.
+                CREATE TABLE IF NOT EXISTS report_item (
+                    report_id INTEGER NOT NULL REFERENCES report(id),
+                    item TEXT NOT NULL,
+                    PRIMARY KEY (report_id, item)
+                );
+
+                -- Latest QC conclusion per report.  ``stale`` is set by a
+                -- rule revision and cleared by the next successful recompute.
+                CREATE TABLE IF NOT EXISTS qc_verdict (
+                    report_id INTEGER PRIMARY KEY REFERENCES report(id),
+                    status TEXT NOT NULL
+                        CHECK (status IN ('analyzable', 'pending_review', 'undetermined')),
+                    findings_json TEXT NOT NULL DEFAULT '[]',
+                    uncovered_json TEXT NOT NULL DEFAULT '[]',
+                    stale INTEGER NOT NULL DEFAULT 0,
+                    stale_reason TEXT,
+                    computed_at TEXT NOT NULL,
+                    instance TEXT NOT NULL
+                );
+
+                -- Rule versions each verdict was computed with.
+                CREATE TABLE IF NOT EXISTS qc_verdict_rule (
+                    report_id INTEGER NOT NULL REFERENCES report(id),
+                    item TEXT NOT NULL,
+                    rule_version INTEGER NOT NULL,
+                    PRIMARY KEY (report_id, item)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_message_created
                     ON message_record(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_message_mark
@@ -173,6 +223,10 @@ class Database:
                     ON delivery(message_id);
                 CREATE INDEX IF NOT EXISTS idx_scan_started
                     ON scan_run(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_report_item_item
+                    ON report_item(item);
+                CREATE INDEX IF NOT EXISTS idx_qc_verdict_status
+                    ON qc_verdict(status, stale);
                 """
             )
             # Small forward-only migrations for databases created by an
@@ -547,6 +601,77 @@ class Database:
                     (utcnow(), message_id),
                 )
 
+    # -------------------------------------------------------------------- QC
+    def qc_rules(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM qc_rule ORDER BY item"
+            ).fetchall()
+
+    def qc_rules_generation(self) -> int:
+        """Monotonic counter bumped by every rule write (recompute guard)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM qc_meta WHERE key='rules_generation'"
+            ).fetchone()
+            return int(row["value"]) if row else 0
+
+    def qc_pending_reports(self) -> list[sqlite3.Row]:
+        """Reports whose conclusion is missing or marked stale."""
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT r.id, r.report_no, r.rows_json
+                   FROM report r
+                   LEFT JOIN qc_verdict v ON v.report_id = r.id
+                   WHERE v.report_id IS NULL OR v.stale = 1
+                   ORDER BY r.id"""
+            ).fetchall()
+
+    def qc_verdicts(
+        self,
+        limit: int = 200,
+        status: str | None = None,
+        stale: bool | None = None,
+    ) -> list[sqlite3.Row]:
+        sql = (
+            """SELECT v.report_id, v.status, v.findings_json, v.uncovered_json,
+                      v.stale, v.stale_reason, v.computed_at, v.instance,
+                      r.report_no, r.sample_no, r.item
+               FROM qc_verdict v
+               JOIN report r ON r.id = v.report_id"""
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("v.status = ?")
+            params.append(status)
+        if stale is not None:
+            clauses.append("v.stale = ?")
+            params.append(1 if stale else 0)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY v.computed_at DESC, v.report_id DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def qc_verdict_for_report(self, report_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM qc_verdict WHERE report_id=?", (report_id,)
+            ).fetchone()
+
+    def qc_verdict_map(self, report_ids: list[int]) -> dict[int, sqlite3.Row]:
+        if not report_ids:
+            return {}
+        marks = ",".join("?" for _ in report_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM qc_verdict WHERE report_id IN ({marks})",
+                list(report_ids),
+            ).fetchall()
+            return {int(row["report_id"]): row for row in rows}
+
     # --------------------------------------------------------------- snapshot
     def stats(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -563,6 +688,22 @@ class Database:
                 "stale_marks": one("SELECT COUNT(*) FROM message_record WHERE mark_state='stale'"),
                 "reports": one("SELECT COUNT(*) FROM report"),
                 "scans": one("SELECT COUNT(*) FROM scan_run"),
+                "qc_rules": one("SELECT COUNT(*) FROM qc_rule"),
+                "qc_analyzable": one(
+                    "SELECT COUNT(*) FROM qc_verdict WHERE status='analyzable' AND stale=0"
+                ),
+                "qc_pending_review": one(
+                    "SELECT COUNT(*) FROM qc_verdict WHERE status='pending_review' AND stale=0"
+                ),
+                "qc_undetermined": one(
+                    "SELECT COUNT(*) FROM qc_verdict WHERE status='undetermined' AND stale=0"
+                ),
+                "qc_stale": one("SELECT COUNT(*) FROM qc_verdict WHERE stale=1"),
+                "qc_uncomputed": one(
+                    """SELECT COUNT(*) FROM report r
+                       LEFT JOIN qc_verdict v ON v.report_id = r.id
+                       WHERE v.report_id IS NULL"""
+                ),
             }
 
     def recent_scans(self, limit: int = 20) -> list[sqlite3.Row]:
